@@ -1,0 +1,233 @@
+//go:build linux
+
+package serial
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+type port struct {
+	fd int
+
+	mut         sync.RWMutex
+	closeSignal *pipe
+
+	readDeadline time.Time
+}
+
+func nativeOpen(path string, conf *Config) (*port, error) {
+	fd, err := unix.Open(
+		path,
+		// https://www.cmrr.umn.edu/~strupp/serial.html#2_5_2
+		// O_NOCTTY: no controlling terminal - prevents input from affecting this process
+		// O_NDELAY: don't wait for DCD signal line to be on space voltage
+		// O_CLOEXEC: close fd on exec, child processes don't need access to the serial port
+		unix.O_RDWR|unix.O_NOCTTY|unix.O_NDELAY|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tty, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return nil, fmt.Errorf("error getting termios: %w", err)
+	}
+
+	termiosSetRaw(tty)
+
+	if err := termiosSetBaudrate(tty, conf.BaudRate); err != nil {
+		return nil, err
+	}
+	if err := termiosSetCharSize(tty, conf.DataBits); err != nil {
+		return nil, err
+	}
+	if err := termiosSetParity(tty, conf.Parity); err != nil {
+		return nil, err
+	}
+	if err := termiosSetStopBits(tty, conf.StopBits); err != nil {
+		return nil, err
+	}
+
+	termiosSetTimeout(tty, 0, 0)
+
+	err = unix.IoctlSetTermios(fd, unix.TCSETS, tty)
+	if err != nil {
+		return nil, fmt.Errorf("error setting termios: %w", err)
+	}
+
+	closeSignal, err := newPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	return &port{fd: fd, closeSignal: closeSignal}, nil
+}
+
+func (p *port) Read(b []byte) (int, error) {
+	p.mut.RLock()
+	defer p.mut.RUnlock()
+
+	if p.fd == -1 {
+		return 0, ErrPortClosed
+	}
+
+	fds := []unix.PollFd{
+		{Fd: int32(p.fd), Events: unix.POLLIN},
+		{Fd: int32(p.closeSignal.ReadFD()), Events: unix.POLLIN},
+	}
+
+	for {
+		timeout := -1 // negative timeout means infinite
+		if !p.readDeadline.IsZero() {
+			timeout = int((p.readDeadline.Sub(time.Now())).Milliseconds())
+			if timeout <= 0 {
+				return 0, os.ErrDeadlineExceeded
+			}
+		}
+
+		n, err := unix.Poll(fds, timeout)
+		if err != nil && errors.Is(err, unix.EINTR) {
+			continue
+		} else if err != nil {
+			return 0, fmt.Errorf("poll error: %w", err)
+		}
+
+		if n == 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+
+		// TODO: do we care about POLLHUP, POLLINV, POLLERR?
+		if fds[1].Revents&unix.POLLIN != 0 {
+			return 0, ErrPortClosed
+		}
+
+		if fds[0].Revents&unix.POLLIN != 0 {
+			return unix.Read(p.fd, b)
+		}
+	}
+}
+
+func (p *port) Write(b []byte) (int, error) {
+	p.mut.RLock()
+	defer p.mut.RUnlock()
+
+	if p.fd == -1 {
+		return 0, ErrPortClosed
+	}
+	return unix.Write(p.fd, b)
+}
+
+func (p *port) SetReadDeadline(t time.Time) error {
+	p.readDeadline = t
+	return nil
+}
+
+func (p *port) SetWriteDeadline(t time.Time) error {
+	// TODO
+	return nil
+}
+
+func (p *port) Close() error {
+	if p.fd == -1 {
+		return nil
+	}
+
+	p.closeSignal.Write([]byte{0})
+
+	p.mut.Lock()
+	defer p.mut.Unlock()
+
+	err := unix.Close(p.fd)
+	p.closeSignal.Close()
+
+	p.fd = -1
+
+	return err
+}
+
+func termiosSetRaw(tty *unix.Termios) {
+	tty.Cflag |= unix.CREAD   // enable receiver
+	tty.Cflag |= unix.CLOCAL  // ignore modem control lines
+	tty.Cflag &^= unix.ICANON // disable canonical mode
+	tty.Cflag &^= unix.ISIG   // don't interpret INTR, SUSP, DSUSP and QUIT characters
+	tty.Cflag &^= unix.ECHO   // don't echo input
+
+	// disable echo handling, shouldn't be necessary as ECHO bit is off but just in case
+	tty.Lflag &^= unix.ECHOE
+	tty.Lflag &^= unix.ECHOK
+	tty.Lflag &^= unix.ECHONL
+	tty.Lflag &^= unix.ECHOCTL
+	tty.Lflag &^= unix.ECHOPRT
+	tty.Lflag &^= unix.ECHOKE
+
+	// disable software flow control
+	tty.Iflag &^= unix.IXON | unix.IXOFF | unix.IXANY
+
+	// disable special handling of received bytes
+	tty.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL
+}
+
+func termiosSetBaudrate(tty *unix.Termios, baudRate int) error {
+	b, ok := baudRates[baudRate]
+	if !ok {
+		return fmt.Errorf("unsupported baud rate: %d", baudRate)
+	}
+	cfSetISpeed(tty, b)
+	cfSetOSpeed(tty, b)
+	return nil
+}
+
+func termiosSetCharSize(tty *unix.Termios, charSize int) error {
+	s, ok := charSizes[charSize]
+	if !ok {
+		return fmt.Errorf("unsupported character size: %d", charSize)
+	}
+	tty.Cflag &^= unix.CSIZE
+	tty.Cflag |= s
+	return nil
+}
+
+func termiosSetStopBits(tty *unix.Termios, stopBits StopBits) error {
+	switch stopBits {
+	case StopBits1, StopBitsNil:
+		tty.Cflag &^= unix.CSTOPB // 1 stop bit
+	case StopBits2:
+		tty.Cflag |= unix.CSTOPB // 2 stop bits
+	default:
+		return fmt.Errorf("unsupported stop bits: %v", stopBits)
+	}
+	return nil
+}
+
+func termiosSetParity(tty *unix.Termios, parity Parity) error {
+	switch parity {
+	case ParityNone:
+		tty.Cflag &^= unix.PARENB // disable parity
+	case ParityEven, ParityNil:
+		tty.Cflag |= unix.PARENB              // enable parity
+		tty.Cflag &^= unix.PARODD             // even parity
+		tty.Iflag |= unix.INPCK | unix.ISTRIP // check parity, strip parity bit
+	case ParityOdd:
+		tty.Cflag |= unix.PARENB              // enable parity
+		tty.Cflag |= unix.PARODD              // odd parity
+		tty.Iflag |= unix.INPCK | unix.ISTRIP // check parity, strip parity bit
+	default:
+		return fmt.Errorf("unsupported parity: %v", parity)
+	}
+	return nil
+}
+
+func termiosSetTimeout(tty *unix.Termios, vtime, vmin byte) {
+	tty.Cc[unix.VTIME] = vtime
+	tty.Cc[unix.VMIN] = vmin
+}
+
+func cfSetISpeed(termios *unix.Termios, speed uint32) { termios.Ispeed = speed }
+func cfSetOSpeed(termios *unix.Termios, speed uint32) { termios.Ospeed = speed }
