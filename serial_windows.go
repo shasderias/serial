@@ -11,6 +11,9 @@ import (
 
 const (
 	maxDWORD = 0xffffffff
+
+	// in milliseconds, https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-commtimeouts
+	tickResolution = 30 // approx 2x of Windows's default timer resolution
 )
 
 type dcb struct {
@@ -127,12 +130,13 @@ const (
 )
 
 type port struct {
-	mut    sync.RWMutex
 	handle windows.Handle
 
-	ro, wo        *windows.Overlapped
-	readDeadline  time.Time
-	writeDeadline time.Time
+	ro, wo           *windows.Overlapped
+	readDeadline     time.Time
+	readDeadlineMut  sync.Mutex
+	writeDeadline    time.Time
+	writeDeadlienMut sync.Mutex
 }
 
 func nativeOpen(path string, conf *Config) (*port, error) {
@@ -179,6 +183,22 @@ func nativeOpen(path string, conf *Config) (*port, error) {
 		return nil, err
 	}
 
+	var ct windows.CommTimeouts
+
+	if err := windows.GetCommTimeouts(handle, &ct); err != nil {
+		return nil, err
+	}
+
+	ct.ReadIntervalTimeout = 0
+	ct.ReadTotalTimeoutMultiplier = 0
+	ct.ReadTotalTimeoutConstant = tickResolution
+	ct.WriteTotalTimeoutMultiplier = 0
+	ct.WriteTotalTimeoutConstant = tickResolution
+
+	if err := windows.SetCommTimeouts(handle, &ct); err != nil {
+		return nil, err
+	}
+
 	ro, err := newOverlapped()
 	if err != nil {
 		return nil, err
@@ -196,123 +216,83 @@ func nativeOpen(path string, conf *Config) (*port, error) {
 }
 
 func (p *port) Read(b []byte) (int, error) {
-	p.mut.RLock()
-	defer p.mut.RUnlock()
+	var read uint32
 
-	if p.handle == windows.InvalidHandle {
-		return 0, ErrPortClosed
-	}
+	for {
+		if p.handle == windows.InvalidHandle {
+			return int(read), ErrPortClosed
+		}
+		if p.readDeadlineExpired() {
+			return int(read), os.ErrDeadlineExceeded
+		}
 
-	var ct windows.CommTimeouts
+		var nul uint32
+		if err := windows.ReadFile(p.handle, b[read:], &nul, p.ro); err != nil {
+			switch err {
+			case windows.ERROR_OPERATION_ABORTED:
+				return int(read), ErrPortClosed
+			case windows.ERROR_IO_PENDING:
+				// not an error, proceed to wait for completion
+			default:
+				return int(read), err
+			}
+		}
 
-	if err := windows.GetCommTimeouts(p.handle, &ct); err != nil {
-		return 0, err
-	}
+		var done uint32
+		if err := windows.GetOverlappedResult(p.handle, p.ro, &done, true); err != nil {
+			switch err {
+			case windows.ERROR_OPERATION_ABORTED:
+				return int(read), ErrPortClosed
+			}
+			return int(read + done), err
+		}
 
-	timeout := uint32(p.readDeadline.Sub(time.Now()).Milliseconds())
-	if timeout <= 0 {
-		return 0, os.ErrDeadlineExceeded
-	}
+		read += done
 
-	if p.readDeadline.IsZero() {
-		ct.ReadIntervalTimeout = maxDWORD
-		ct.ReadTotalTimeoutMultiplier = maxDWORD
-		ct.ReadTotalTimeoutConstant = 0
-	} else {
-		ct.ReadIntervalTimeout = 0
-		ct.ReadTotalTimeoutMultiplier = 0
-		ct.ReadTotalTimeoutConstant = timeout
-	}
-
-	if err := windows.SetCommTimeouts(p.handle, &ct); err != nil {
-		return 0, err
-	}
-
-	var nul uint32
-	if err := windows.ReadFile(p.handle, b, &nul, p.ro); err != nil {
-		switch err {
-		case windows.ERROR_OPERATION_ABORTED:
-			return 0, ErrPortClosed
-		case windows.ERROR_IO_PENDING:
-			// not an error, proceed to wait for completion
-		default:
-			return 0, err
+		if int(read) == len(b) {
+			return int(read), nil
 		}
 	}
-
-	var done uint32
-
-	if err := windows.GetOverlappedResult(p.handle, p.ro, &done, true); err != nil {
-		switch err {
-		case windows.ERROR_OPERATION_ABORTED:
-			return 0, ErrPortClosed
-		}
-		return 0, err
-	}
-
-	if !p.readDeadline.IsZero() && int(done) < len(b) {
-		return int(done), os.ErrDeadlineExceeded
-	}
-
-	return int(done), nil
 }
 
 func (p *port) Write(b []byte) (int, error) {
-	p.mut.RLock()
-	defer p.mut.RUnlock()
+	var written uint32
 
-	if p.handle == windows.InvalidHandle {
-		return 0, ErrPortClosed
-	}
+	for {
+		if p.handle == windows.InvalidHandle {
+			return int(written), ErrPortClosed
+		}
+		if p.writeDeadlineExpired() {
+			return int(written), os.ErrDeadlineExceeded
+		}
 
-	var ct windows.CommTimeouts
-
-	if err := windows.GetCommTimeouts(p.handle, &ct); err != nil {
-		return 0, err
-	}
-
-	timeout := uint32(p.writeDeadline.Sub(time.Now()).Milliseconds())
-	if timeout <= 0 {
-		return 0, os.ErrDeadlineExceeded
-	}
-
-	if p.writeDeadline.IsZero() {
-		ct.WriteTotalTimeoutMultiplier = 0
-		ct.WriteTotalTimeoutConstant = 0
-	} else {
-		ct.WriteTotalTimeoutMultiplier = 0
-		ct.WriteTotalTimeoutConstant = timeout
-	}
-
-	if err := windows.SetCommTimeouts(p.handle, &ct); err != nil {
-		return 0, err
-	}
-
-	var nul uint32
-	if err := windows.WriteFile(p.handle, b, &nul, p.wo); err != nil {
-		switch err {
-		case windows.ERROR_OPERATION_ABORTED:
-			return 0, ErrPortClosed
-		case windows.ERROR_IO_PENDING:
+		var nul uint32
+		if err := windows.WriteFile(p.handle, b, &nul, p.wo); err != nil {
+			switch err {
+			case windows.ERROR_OPERATION_ABORTED:
+				return int(written), ErrPortClosed
+			case windows.ERROR_IO_PENDING:
 			// not an error, proceed to wait for completion
+			default:
+				return int(written), err
+			}
 		}
-		return 0, err
-	}
 
-	var done uint32
-	if err := windows.GetOverlappedResult(p.handle, p.wo, &done, true); err != nil {
-		switch err {
-		case windows.ERROR_OPERATION_ABORTED:
-			return 0, ErrPortClosed
+		var done uint32
+		if err := windows.GetOverlappedResult(p.handle, p.wo, &done, true); err != nil {
+			switch err {
+			case windows.ERROR_OPERATION_ABORTED:
+				return int(written + done), ErrPortClosed
+			}
+			return int(written + done), err
 		}
-		return 0, err
-	}
 
-	if !p.writeDeadline.IsZero() && int(done) < len(b) {
-		return int(done), os.ErrDeadlineExceeded
-	}
+		written += done
 
-	return int(done), nil
+		if int(written) == len(b) {
+			return int(written), nil
+		}
+	}
 }
 
 func (p *port) Close() error {
@@ -335,13 +315,33 @@ func (p *port) Close() error {
 }
 
 func (p *port) SetReadDeadline(t time.Time) error {
+	p.readDeadlineMut.Lock()
+	defer p.readDeadlineMut.Unlock()
+
 	p.readDeadline = t
 	return nil
 }
 
+func (p *port) readDeadlineExpired() bool {
+	p.readDeadlineMut.Lock()
+	defer p.readDeadlineMut.Unlock()
+
+	return !p.readDeadline.IsZero() && time.Now().After(p.readDeadline)
+}
+
 func (p *port) SetWriteDeadline(t time.Time) error {
+	p.writeDeadlienMut.Lock()
+	defer p.writeDeadlienMut.Unlock()
+
 	p.writeDeadline = t
 	return nil
+}
+
+func (p *port) writeDeadlineExpired() bool {
+	p.writeDeadlienMut.Lock()
+	defer p.writeDeadlienMut.Unlock()
+
+	return !p.writeDeadline.IsZero() && time.Now().After(p.writeDeadline)
 }
 
 func dcbInit(d *dcb) {

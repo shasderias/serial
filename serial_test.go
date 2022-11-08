@@ -3,6 +3,7 @@ package serial_test
 import (
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -93,6 +94,100 @@ func TestReadDeadline(t *testing.T) {
 		t.Fatal("got blocking Read(); want Read() to timeout")
 	case <-done:
 		<-alarm
+	}
+}
+
+func TestSetReadDeadlineClearsBlocked(t *testing.T) {
+	portAConnStr, _ := setupLoopbackPorts(t)
+
+	port1, err := serial.Open(portAConnStr, &serial.Config{
+		BaudRate: baudRate,
+		DataBits: dataBits,
+		Parity:   parity,
+		StopBits: stopBits,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer port1.Close()
+
+	port1.SetReadDeadline(time.Time{})
+
+	blockedReadDone := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 32)
+		_, err := port1.Read(buf)
+		if err != nil && err != os.ErrDeadlineExceeded {
+			t.Log(err)
+			t.Fail()
+		}
+		blockedReadDone <- struct{}{}
+	}()
+
+	select {
+	case <-time.After(longSleepDuration):
+	case <-blockedReadDone:
+		t.Fatal("want read to still be blocked")
+	}
+
+	port1.SetReadDeadline(time.Now())
+
+	select {
+	case <-time.After(longSleepDuration):
+		t.Fatal("want read to be unblocked when deadline is set")
+	case <-blockedReadDone:
+	}
+}
+
+func TestLargeRead(t *testing.T) {
+	const largeBufSize = 4 * 1024 * 1024 // should be bigger than OS buffers
+
+	port1, port2 := getTestPorts(t)
+	defer port1.Close()
+	defer port2.Close()
+
+	sendBuf := make([]byte, largeBufSize)
+	sendBuf[1024] = 0x13
+
+	recvBuf := make([]byte, largeBufSize)
+
+	wg := sync.WaitGroup{}
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		n, err := port1.Write(sendBuf)
+		t.Log("wrote")
+		if err != nil {
+			t.Log(err)
+			t.Fail()
+			return
+		}
+		if n != largeBufSize {
+			t.Logf("%d bytes written; expected %d", n, largeBufSize)
+			t.Fail()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		n, err := port2.Read(recvBuf)
+		t.Log("read")
+		if err != nil && err != os.ErrDeadlineExceeded {
+			t.Log(err)
+			t.Fail()
+		}
+		if n != largeBufSize {
+			t.Logf("%d bytes read; want %d", n, largeBufSize)
+			t.Fail()
+		}
+	}()
+
+	wg.Wait()
+	if recvBuf[1024] != 0x13 {
+		t.Fatalf("read %x; want %x", recvBuf[1024], 0x13)
 	}
 }
 
@@ -227,6 +322,7 @@ func TestFullDuplex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer port.Close()
 
 	go func() {
 		buf := make([]byte, 32)

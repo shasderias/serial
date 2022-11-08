@@ -3,7 +3,6 @@
 package serial
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -12,13 +11,23 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	tickResolution = 1 // deciseconds
+)
+
 type port struct {
 	fd int
 
 	mut         sync.RWMutex
 	closeSignal *pipe
 
-	readDeadline time.Time
+	closing    bool
+	closingMut sync.Mutex
+
+	readDeadline     time.Time
+	readDeadlineMut  sync.Mutex
+	writeDeadline    time.Time
+	writeDeadlineMut sync.Mutex
 }
 
 func nativeOpen(path string, conf *Config) (*port, error) {
@@ -55,7 +64,7 @@ func nativeOpen(path string, conf *Config) (*port, error) {
 		return nil, err
 	}
 
-	termiosSetTimeout(tty, 0, 0)
+	termiosSetTimeout(tty, tickResolution, 0)
 
 	err = unix.IoctlSetTermios(fd, unix.TCSETS, tty)
 	if err != nil {
@@ -74,42 +83,28 @@ func (p *port) Read(b []byte) (int, error) {
 	p.mut.RLock()
 	defer p.mut.RUnlock()
 
-	if p.fd == -1 {
-		return 0, ErrPortClosed
-	}
-
-	fds := []unix.PollFd{
-		{Fd: int32(p.fd), Events: unix.POLLIN},
-		{Fd: int32(p.closeSignal.ReadFD()), Events: unix.POLLIN},
-	}
+	var read int
 
 	for {
-		timeout := -1 // negative timeout means infinite
-		if !p.readDeadline.IsZero() {
-			timeout = int((p.readDeadline.Sub(time.Now())).Milliseconds())
-			if timeout <= 0 {
-				return 0, os.ErrDeadlineExceeded
-			}
+		if p.isClosing() || p.fd == -1 {
+			return read, ErrPortClosed
+		}
+		if p.readDeadlineExpired() {
+			return read, os.ErrDeadlineExceeded
 		}
 
-		n, err := unix.Poll(fds, timeout)
-		if err != nil && errors.Is(err, unix.EINTR) {
-			continue
-		} else if err != nil {
-			return 0, fmt.Errorf("poll error: %w", err)
+		n, err := unix.Read(p.fd, b[read:])
+		switch {
+		case err == unix.EAGAIN:
+			// do nothing
+		case err != nil:
+			return n + read, err
+		default:
+			read += n
 		}
 
-		if n == 0 {
-			return 0, os.ErrDeadlineExceeded
-		}
-
-		// TODO: do we care about POLLHUP, POLLINV, POLLERR?
-		if fds[1].Revents&unix.POLLIN != 0 {
-			return 0, ErrPortClosed
-		}
-
-		if fds[0].Revents&unix.POLLIN != 0 {
-			return unix.Read(p.fd, b)
+		if read == len(b) {
+			return read, nil
 		}
 	}
 }
@@ -118,20 +113,62 @@ func (p *port) Write(b []byte) (int, error) {
 	p.mut.RLock()
 	defer p.mut.RUnlock()
 
-	if p.fd == -1 {
-		return 0, ErrPortClosed
+	var written int
+
+	for {
+		if p.isClosing() || p.fd == -1 {
+			return written, ErrPortClosed
+		}
+		if p.writeDeadlineExpired() {
+			return written, os.ErrDeadlineExceeded
+		}
+
+		n, err := unix.Write(p.fd, b[written:])
+		switch {
+		case err == unix.EAGAIN:
+			// do nothing
+		case err != nil:
+			return n + written, err
+		default:
+			written += n
+		}
+
+		if written == len(b) {
+			return written, nil
+		}
 	}
-	return unix.Write(p.fd, b)
 }
 
 func (p *port) SetReadDeadline(t time.Time) error {
+	p.readDeadlineMut.Lock()
+	defer p.readDeadlineMut.Unlock()
 	p.readDeadline = t
 	return nil
 }
 
+func (p *port) readDeadlineExpired() bool {
+	p.readDeadlineMut.Lock()
+	defer p.readDeadlineMut.Unlock()
+	return !p.readDeadline.IsZero() && time.Now().After(p.readDeadline)
+}
+
 func (p *port) SetWriteDeadline(t time.Time) error {
-	// TODO
+	p.writeDeadlineMut.Lock()
+	defer p.writeDeadlineMut.Unlock()
+	p.writeDeadline = t
 	return nil
+}
+
+func (p *port) writeDeadlineExpired() bool {
+	p.writeDeadlineMut.Lock()
+	defer p.writeDeadlineMut.Unlock()
+	return !p.writeDeadline.IsZero() && time.Now().After(p.writeDeadline)
+}
+
+func (p *port) isClosing() bool {
+	p.closingMut.Lock()
+	defer p.closingMut.Unlock()
+	return p.closing
 }
 
 func (p *port) Close() error {
@@ -139,13 +176,17 @@ func (p *port) Close() error {
 		return nil
 	}
 
-	p.closeSignal.Write([]byte{0})
+	p.closingMut.Lock()
+	p.closing = true
+	p.closingMut.Unlock()
+
+	//p.closeSignal.Write([]byte{0})
 
 	p.mut.Lock()
 	defer p.mut.Unlock()
 
 	err := unix.Close(p.fd)
-	p.closeSignal.Close()
+	//p.closeSignal.Close()
 
 	p.fd = -1
 
