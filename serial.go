@@ -24,6 +24,7 @@ const (
 )
 
 var (
+	ErrPortInUse  = errors.New("serial: port in use")
 	ErrPortClosed = errors.New("serial: port closed")
 )
 

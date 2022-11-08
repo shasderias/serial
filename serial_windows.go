@@ -156,6 +156,10 @@ func nativeOpen(path string, conf *Config) (*port, error) {
 		0,                            // must be NULL for comm devices
 	)
 	if err != nil {
+		switch err {
+		case windows.ERROR_ACCESS_DENIED:
+			return nil, ErrPortInUse
+		}
 		return nil, err
 	}
 
