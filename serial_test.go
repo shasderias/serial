@@ -140,6 +140,60 @@ func TestSetReadDeadlineClearsBlocked(t *testing.T) {
 	}
 }
 
+func TestRainbow(t *testing.T) {
+	port1, port2 := getTestPorts(t)
+	defer port1.Close()
+	defer port2.Close()
+
+	sendBuf := make([]byte, 256)
+	for i := 0; i < len(sendBuf); i++ {
+		sendBuf[i] = byte(i)
+	}
+
+	recvBuf := make([]byte, 256)
+
+	wg := sync.WaitGroup{}
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		n, err := port1.Write(sendBuf)
+		t.Log("wrote")
+		if err != nil {
+			t.Log(err)
+			t.Fail()
+			return
+		}
+		if n != len(sendBuf) {
+			t.Logf("%d bytes written; want %d", n, len(sendBuf))
+			t.Fail()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		n, err := port2.Read(recvBuf)
+		t.Log("read")
+		if err != nil && err != os.ErrDeadlineExceeded {
+			t.Log(err)
+			t.Fail()
+		}
+		if n != len(recvBuf) {
+			t.Logf("%d bytes read; want %d", n, len(recvBuf))
+			t.Fail()
+		}
+	}()
+
+	wg.Wait()
+	for i := 0; i < len(recvBuf); i++ {
+		if recvBuf[i] != sendBuf[i] {
+			t.Log("mismatch at", i)
+			t.Fail()
+		}
+	}
+}
+
 func TestLargeRead(t *testing.T) {
 	const largeBufSize = 4 * 1024 * 1024 // should be bigger than OS buffers
 

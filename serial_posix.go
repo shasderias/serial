@@ -199,6 +199,7 @@ func termiosSetRaw(tty *unix.Termios) {
 	tty.Cflag &^= unix.ICANON // disable canonical mode
 	tty.Cflag &^= unix.ISIG   // don't interpret INTR, SUSP, DSUSP and QUIT characters
 	tty.Cflag &^= unix.ECHO   // don't echo input
+	tty.Cflag &^= unix.OPOST  // disable output processing
 
 	// disable echo handling, shouldn't be necessary as ECHO bit is off but just in case
 	tty.Lflag &^= unix.ECHOE
@@ -252,13 +253,15 @@ func termiosSetParity(tty *unix.Termios, parity Parity) error {
 	case ParityNone:
 		tty.Cflag &^= unix.PARENB // disable parity
 	case ParityEven, ParityNil:
-		tty.Cflag |= unix.PARENB              // enable parity
-		tty.Cflag &^= unix.PARODD             // even parity
-		tty.Iflag |= unix.INPCK | unix.ISTRIP // check parity, strip parity bit
+		tty.Cflag |= unix.PARENB  // enable parity
+		tty.Cflag &^= unix.PARODD // even parity
+		tty.Iflag |= unix.INPCK   // check parity
+		tty.Iflag &^= unix.IGNPAR // don't ignore framing errors and parity errors
 	case ParityOdd:
-		tty.Cflag |= unix.PARENB              // enable parity
-		tty.Cflag |= unix.PARODD              // odd parity
-		tty.Iflag |= unix.INPCK | unix.ISTRIP // check parity, strip parity bit
+		tty.Cflag |= unix.PARENB  // enable parity
+		tty.Cflag |= unix.PARODD  // odd parity
+		tty.Iflag |= unix.INPCK   // check parity
+		tty.Iflag &^= unix.IGNPAR // don't ignore framing errors and parity errors
 	default:
 		return fmt.Errorf("unsupported parity: %v", parity)
 	}
