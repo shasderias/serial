@@ -34,12 +34,30 @@ func nativeOpen(path string, conf *Config) (*port, error) {
 	fd, err := unix.Open(
 		path,
 		// https://www.cmrr.umn.edu/~strupp/serial.html#2_5_2
+		// https://www.gnu.org/software/libc/manual/html_node/Operating-Modes.html
 		// O_NOCTTY: no controlling terminal - prevents input from affecting this process
 		// O_NDELAY: don't wait for DCD signal line to be on space voltage
 		// O_CLOEXEC: close fd on exec, child processes don't need access to the serial port
 		unix.O_RDWR|unix.O_NOCTTY|unix.O_NDELAY|unix.O_CLOEXEC,
 		0,
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	// O_NDELAY/O_NONBLOCK has overloaded semantics, setting it on Open() means don't block for
+	// a "long time" when opening. For serial ports, it may mean waiting for a carrier signal.
+	// After the port is opened, the flag determines whether IO is blocking or non-blocking.
+	// As we use blocking I/O with timeouts (VTIME/VMIN), we need to clear O_NDELAY/O_NONBLOCK.
+	// TODO: what about writes?
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	flags &^= unix.O_NDELAY
+
+	_, err = unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +114,7 @@ func (p *port) Read(b []byte) (int, error) {
 		n, err := unix.Read(p.fd, b[read:])
 		switch {
 		case err == unix.EAGAIN:
-			// do nothing
+			time.Sleep(time.Millisecond)
 		case err != nil:
 			return n + read, err
 		default:
@@ -126,7 +144,7 @@ func (p *port) Write(b []byte) (int, error) {
 		n, err := unix.Write(p.fd, b[written:])
 		switch {
 		case err == unix.EAGAIN:
-			// do nothing
+			time.Sleep(time.Millisecond)
 		case err != nil:
 			return n + written, err
 		default:
