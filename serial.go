@@ -41,7 +41,7 @@ type Port interface {
 	SetWriteDeadline(t time.Time) error
 }
 
-func Open(address string, cFns ...func(*Config)) (p Port, err error) {
+func Open(address string, cFns ...func(c *Config)) (p Port, err error) {
 	conf := Config{}
 	for _, cFn := range cFns {
 		cFn(&conf)
