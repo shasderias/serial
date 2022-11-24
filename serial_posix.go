@@ -239,8 +239,8 @@ func termiosSetBaudrate(tty *unix.Termios, baudRate int) error {
 	if !ok {
 		return fmt.Errorf("unsupported baud rate: %d", baudRate)
 	}
-	cfSetISpeed(tty, b)
-	cfSetOSpeed(tty, b)
+	tty.Cflag &^= unix.CBAUD
+	tty.Cflag |= b
 	return nil
 }
 
@@ -290,6 +290,3 @@ func termiosSetTimeout(tty *unix.Termios, vtime, vmin byte) {
 	tty.Cc[unix.VTIME] = vtime
 	tty.Cc[unix.VMIN] = vmin
 }
-
-func cfSetISpeed(termios *unix.Termios, speed uint32) { termios.Ispeed = speed }
-func cfSetOSpeed(termios *unix.Termios, speed uint32) { termios.Ospeed = speed }

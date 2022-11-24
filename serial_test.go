@@ -3,6 +3,9 @@ package serial_test
 import (
 	"errors"
 	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -60,11 +63,11 @@ func TestSanity(t *testing.T) {
 func TestReadDeadline(t *testing.T) {
 	portAConnStr, _ := setupLoopbackPorts(t)
 
-	port1, err := serial.Open(portAConnStr, &serial.Config{
-		BaudRate: baudRate,
-		DataBits: dataBits,
-		Parity:   parity,
-		StopBits: stopBits,
+	port1, err := serial.Open(portAConnStr, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -100,11 +103,11 @@ func TestReadDeadline(t *testing.T) {
 func TestSetReadDeadlineClearsBlocked(t *testing.T) {
 	portAConnStr, _ := setupLoopbackPorts(t)
 
-	port1, err := serial.Open(portAConnStr, &serial.Config{
-		BaudRate: baudRate,
-		DataBits: dataBits,
-		Parity:   parity,
-		StopBits: stopBits,
+	port1, err := serial.Open(portAConnStr, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -250,11 +253,11 @@ func TestSerialReadAndCloseConcurrency(t *testing.T) {
 	// the correct multitasking behaviour is happening.
 	portPath, _ := setupLoopbackPorts(t)
 
-	port, err := serial.Open(portPath, &serial.Config{
-		BaudRate: baudRate,
-		DataBits: dataBits,
-		Parity:   parity,
-		StopBits: stopBits,
+	port, err := serial.Open(portPath, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -269,11 +272,11 @@ func TestSerialReadAndCloseConcurrency(t *testing.T) {
 func TestDoubleCloseIsNoop(t *testing.T) {
 	portPath, _ := setupLoopbackPorts(t)
 
-	port, err := serial.Open(portPath, &serial.Config{
-		BaudRate: baudRate,
-		DataBits: dataBits,
-		Parity:   parity,
-		StopBits: stopBits,
+	port, err := serial.Open(portPath, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -319,11 +322,11 @@ func TestBlockingRead(t *testing.T) {
 func getTestPorts(t *testing.T) (serial.Port, serial.Port) {
 	portAConnStr, portBConnStr := setupLoopbackPorts(t)
 
-	port1, err := serial.Open(portAConnStr, &serial.Config{
-		BaudRate: baudRate,
-		DataBits: dataBits,
-		StopBits: stopBits,
-		Parity:   parity,
+	port1, err := serial.Open(portAConnStr, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -341,11 +344,11 @@ func getTestPorts(t *testing.T) (serial.Port, serial.Port) {
 		t.Fatal(err)
 	}
 
-	port2, err := serial.Open(portBConnStr, &serial.Config{
-		BaudRate: baudRate,
-		DataBits: dataBits,
-		StopBits: stopBits,
-		Parity:   parity,
+	port2, err := serial.Open(portBConnStr, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -367,11 +370,11 @@ func getTestPorts(t *testing.T) (serial.Port, serial.Port) {
 func TestFullDuplex(t *testing.T) {
 	portPath, _ := setupLoopbackPorts(t)
 
-	port, err := serial.Open(portPath, &serial.Config{
-		BaudRate: baudRate,
-		DataBits: dataBits,
-		Parity:   parity,
-		StopBits: stopBits,
+	port, err := serial.Open(portPath, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -415,4 +418,43 @@ func TestFullDuplex(t *testing.T) {
 	}
 
 	time.Sleep(longSleepDuration + time.Second)
+}
+
+func TestBaudRate(t *testing.T) {
+	portPath, _ := setupLoopbackPorts(t)
+
+	port, err := serial.Open(portPath, func(c *serial.Config) {
+		c.BaudRate = baudRate
+		c.DataBits = dataBits
+		c.Parity = parity
+		c.StopBits = stopBits
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer port.Close()
+
+	sttyCmd := exec.Command("stty", "-F", portPath)
+	out, err := sttyCmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	matches := regexp.MustCompile(`speed (\d+) baud`).FindAllSubmatch(out, -1)
+	if len(matches) != 1 {
+		t.Fatalf("stty output did not contain baud rate or contained more than one baud rate: %s", out)
+	}
+
+	if len(matches[0]) != 2 {
+		t.Fatalf("want regexp match to contain 2 submatches, got %d: %v", len(matches[0]), matches[0])
+	}
+
+	gotBaudRate, err := strconv.Atoi(string(matches[0][1]))
+	if err != nil {
+		t.Fatalf("error parsing baud rate as integer: %s, %v", matches[0], err)
+	}
+
+	if gotBaudRate != baudRate {
+		t.Fatalf("got baud rate %d; want %d", gotBaudRate, baudRate)
+	}
 }
