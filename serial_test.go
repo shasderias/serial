@@ -3,9 +3,6 @@ package serial_test
 import (
 	"errors"
 	"os"
-	"os/exec"
-	"regexp"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -418,43 +415,4 @@ func TestFullDuplex(t *testing.T) {
 	}
 
 	time.Sleep(longSleepDuration + time.Second)
-}
-
-func TestBaudRate(t *testing.T) {
-	portPath, _ := setupLoopbackPorts(t)
-
-	port, err := serial.Open(portPath, func(c *serial.Config) {
-		c.BaudRate = baudRate
-		c.DataBits = dataBits
-		c.Parity = parity
-		c.StopBits = stopBits
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer port.Close()
-
-	sttyCmd := exec.Command("stty", "-F", portPath)
-	out, err := sttyCmd.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	matches := regexp.MustCompile(`speed (\d+) baud`).FindAllSubmatch(out, -1)
-	if len(matches) != 1 {
-		t.Fatalf("stty output did not contain baud rate or contained more than one baud rate: %s", out)
-	}
-
-	if len(matches[0]) != 2 {
-		t.Fatalf("want regexp match to contain 2 submatches, got %d: %v", len(matches[0]), matches[0])
-	}
-
-	gotBaudRate, err := strconv.Atoi(string(matches[0][1]))
-	if err != nil {
-		t.Fatalf("error parsing baud rate as integer: %s, %v", matches[0], err)
-	}
-
-	if gotBaudRate != baudRate {
-		t.Fatalf("got baud rate %d; want %d", gotBaudRate, baudRate)
-	}
 }

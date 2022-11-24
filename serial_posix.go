@@ -212,13 +212,15 @@ func (p *port) Close() error {
 }
 
 func termiosSetRaw(tty *unix.Termios) {
-	tty.Cflag |= unix.CREAD   // enable receiver
-	tty.Cflag |= unix.CLOCAL  // ignore modem control lines
-	tty.Cflag &^= unix.ICANON // disable canonical mode
-	tty.Cflag &^= unix.ISIG   // don't interpret INTR, SUSP, DSUSP and QUIT characters
-	tty.Cflag &^= unix.ECHO   // don't echo input
-	tty.Cflag &^= unix.OPOST  // disable output processing
+	tty.Cflag |= unix.CREAD  // enable receiver
+	tty.Cflag |= unix.CLOCAL // ignore modem control lines
 
+	tty.Oflag &^= unix.OPOST // disable output processing
+
+	tty.Lflag &^= unix.ECHO   // don't echo input
+	tty.Lflag &^= unix.ISIG   // don't interpret INTR, SUSP, DSUSP and QUIT characters
+	tty.Lflag &^= unix.ICANON // disable canonical mode
+	tty.Lflag &^= unix.IEXTEN // disable implementation-defined input processing
 	// disable echo handling, shouldn't be necessary as ECHO bit is off but just in case
 	tty.Lflag &^= unix.ECHOE
 	tty.Lflag &^= unix.ECHOK
